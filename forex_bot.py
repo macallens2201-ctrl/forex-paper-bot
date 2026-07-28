@@ -1,5 +1,5 @@
 """
-Bot de PAPER TRADING Forex - 3 profils de risque (script unique)
+Bot de PAPER TRADING Forex + matieres premieres - 3 profils de risque
 ====================================================================================
 
 Ce script pilote UN SEUL bot a la fois, selon la variable d'environnement
@@ -36,17 +36,21 @@ import requests
 # ------------------------------------------------------------------
 # PROFILS DE RISQUE
 # ------------------------------------------------------------------
+# Chaque instrument (forex ou matiere premiere) a desormais ses PROPRES
+# parametres SMA / stop / take, car le backtest (2026-07-28, ~69 jours de
+# donnees reelles OANDA en M5) montre qu'un seul reglage partage par profil
+# ne fonctionne pas bien d'un instrument a l'autre (ex: le couple SMA
+# optimal pour l'EUR/USD est carrement perdant sur le cuivre).
 
 PROFILES = {
     "LOW": {
         "label": "Risque Faible",
         "notional_capital": 10000.0,
         "risk_per_trade_pct": 0.5,
-        "instruments": ["EUR_USD"],
-        "fast_sma": 50,
-        "slow_sma": 200,
-        "sl_pips": 30,
-        "tp_pips": 90,               # ratio 1:3
+        "instruments": {
+            "EUR_USD": {"fast_sma": 50, "slow_sma": 80, "sl_pips": 30, "tp_pips": 90},
+            "XCU_USD": {"fast_sma": 200, "slow_sma": 300, "sl_pips": 782, "tp_pips": 2346},
+        },
         "max_trades_per_day_per_pair": 1,
         "max_margin_usage_pct": 25.0,
         "daily_loss_circuit_breaker_pct": 2.0,
@@ -55,11 +59,13 @@ PROFILES = {
         "label": "Risque Modere",
         "notional_capital": 10000.0,
         "risk_per_trade_pct": 2.0,
-        "instruments": ["EUR_USD", "GBP_USD", "USD_JPY"],
-        "fast_sma": 15,
-        "slow_sma": 20,
-        "sl_pips": 25,
-        "tp_pips": 50,                # ratio 1:2
+        "instruments": {
+            "EUR_USD": {"fast_sma": 20, "slow_sma": 60, "sl_pips": 25, "tp_pips": 50},
+            "GBP_USD": {"fast_sma": 20, "slow_sma": 60, "sl_pips": 25, "tp_pips": 50},
+            "USD_JPY": {"fast_sma": 20, "slow_sma": 60, "sl_pips": 25, "tp_pips": 50},
+            "XCU_USD": {"fast_sma": 30, "slow_sma": 60, "sl_pips": 651, "tp_pips": 1302},
+            "NATGAS_USD": {"fast_sma": 20, "slow_sma": 30, "sl_pips": 4, "tp_pips": 8},
+        },
         "max_trades_per_day_per_pair": 2,
         "max_margin_usage_pct": 50.0,
         "daily_loss_circuit_breaker_pct": 4.0,
@@ -68,33 +74,74 @@ PROFILES = {
         "label": "Risque Eleve",
         "notional_capital": 10000.0,
         "risk_per_trade_pct": 5.0,
-        "instruments": ["EUR_USD", "GBP_USD", "USD_JPY", "GBP_JPY", "AUD_USD", "EUR_JPY"],
-        "fast_sma": 10,
-        "slow_sma": 15,
-        "sl_pips": 15,
-        "tp_pips": 30,                 # ratio 1:2, signaux plus frequents
+        "instruments": {
+            "EUR_USD": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "GBP_USD": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "USD_JPY": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "GBP_JPY": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "AUD_USD": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "EUR_JPY": {"fast_sma": 8, "slow_sma": 15, "sl_pips": 15, "tp_pips": 30},
+            "XCU_USD": {"fast_sma": 20, "slow_sma": 45, "sl_pips": 391, "tp_pips": 782},
+            "NATGAS_USD": {"fast_sma": 10, "slow_sma": 15, "sl_pips": 2, "tp_pips": 4},
+        },
         "max_trades_per_day_per_pair": 3,
         "max_margin_usage_pct": 75.0,
         "daily_loss_circuit_breaker_pct": 8.0,
     },
 }
-# Parametres SMA (fast/slow) recalibres le 2026-07-28 a partir d'un backtest sur
-# ~52 jours de donnees reelles OANDA M15 (66 combinaisons testees par profil,
-# stop/take fixes selon le profil, une seule position a la fois par paire).
-# LOW (EUR/USD) volontairement laisse inchange (50/200) : sur cet echantillon,
-# seules 2/66 combinaisons etaient gagnantes, toutes deux avec ~12-13 trades
-# seulement sur 52 jours - pas assez pour distinguer un vrai signal du bruit,
-# et leurs voisins immediats dans la grille etaient nettement perdants
-# (pas de "plateau" robuste, juste un pic isole = probable overfitting).
-# MODERATE (20/50 -> 15/20) et HIGH (10/30 -> 10/15) ont ete resserres car ces
-# zones formaient un plateau robuste de resultats positifs chez plusieurs
-# combinaisons voisines, avec un nombre de trades bien plus eleve (n=134 et
-# n=693 sur la periode testee) donnant une significativite statistique correcte.
-# A revalider periodiquement (walk-forward) : un backtest sur 52 jours reste
+# Historique des recalibrages :
+#
+# 2026-07-28 (a) SMA forex M15 -> plateau robuste retenu pour MODERATE/HIGH,
+# LOW laisse inchange (signal trop faible, pic isole non robuste).
+#
+# 2026-07-28 (b) Passage a la granularite M5 + execution toutes les 5 min
+# (au lieu de M15/15 min), rendu possible par le passage du repo GitHub en
+# public (minutes Actions illimitees). Backtest sur ~69 jours de donnees
+# reelles M5 : gain confirme sur les 3 profils par rapport au M15 (LOW :
+# 2/66 combinaisons gagnantes -> 13/36 avec de meilleures performances ;
+# MODERATE : +/-neutre -> plateau robuste tres positif ; HIGH : deja bon,
+# encore ameliore). Nouveaux reglages : LOW 50/80, MODERATE 20/60,
+# HIGH 8/15 (periodes en nombre de bougies M5).
+#
+# 2026-07-28 (c) Ajout de matieres premieres apres backtest comparatif sur
+# Or, Argent, Petrole WTI, Brent, Gaz naturel et Cuivre (meme fenetre de
+# 69 jours, SL/TP recalibres par instrument pour une distance de stop
+# proportionnellement equivalente a celle utilisee sur l'EUR/USD, mesuree
+# en multiples de l'amplitude moyenne par bougie M5). Resultats : Or et
+# Petrole (WTI/Brent) rejetes (quasi aucune combinaison gagnante, marche
+# trop directionnel/tendanciel pour un croisement de moyennes sur cette
+# periode). Cuivre et Gaz naturel retenus (plateaux robustes et positifs
+# sur les 3 profils). Argent teste mais moins robuste que le cuivre a risque
+# egal, non retenu. Le cuivre est ajoute a LOW (seul le plus selectif est
+# garde, en coherence avec sa philosophie 1 seul instrument tres selectif),
+# le cuivre ET le gaz naturel sont ajoutes a MODERATE et HIGH.
+#
+# Attention : le gaz naturel a une frequence de signal tres elevee en brut
+# (jusqu'a plusieurs dizaines par jour) ; le plafond "max_trades_per_day_per_pair"
+# du profil filtre fortement ce nombre en production, donc le nombre reel de
+# trades sera nettement inferieur a celui observe dans le backtest brut.
+# Ses stops/takes en "pips" paraissent tres petits (2-8) : c'est normal, le
+# gaz naturel cote avec une precision differente du forex (voir pip_size) ;
+# en proportion du prix, ces stops sont calibres pour etre comparables a
+# ceux utilises sur l'EUR/USD.
+#
+# A revalider periodiquement (walk-forward) : un backtest sur 69 jours reste
 # un seul regime de marche, pas une garantie de performance future.
 
-GRANULARITY = "M15"
-ASSUMED_MARGIN_RATE = 1 / 30   # levier suppose 30:1 (standard UE sur les majors)
+GRANULARITY = "M5"
+ASSUMED_MARGIN_RATE = 1 / 30   # levier suppose 30:1 (standard UE sur les majors forex)
+
+# Taille de pip et taux de marge specifiques a certains instruments non-forex.
+PIP_SIZES = {
+    "XAU_USD": 0.01,
+    "XAG_USD": 0.0001,
+    "XCU_USD": 0.0001,
+    "NATGAS_USD": 0.01,
+}
+MARGIN_RATES = {
+    "XCU_USD": 0.10,
+    "NATGAS_USD": 0.10,
+}
 
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
@@ -120,7 +167,13 @@ def check_config():
 
 
 def pip_size(instrument):
+    if instrument in PIP_SIZES:
+        return PIP_SIZES[instrument]
     return 0.01 if instrument.endswith("JPY") else 0.0001
+
+
+def margin_rate(instrument):
+    return MARGIN_RATES.get(instrument, ASSUMED_MARGIN_RATE)
 
 
 def api_headers():
@@ -183,15 +236,15 @@ def get_open_position(instrument):
     return None
 
 
-def calculate_units(cfg, instrument):
+def calculate_units(cfg, instrument, instr_cfg):
     risk_amount = cfg["notional_capital"] * (cfg["risk_per_trade_pct"] / 100)
-    stop_distance = cfg["sl_pips"] * pip_size(instrument)
+    stop_distance = instr_cfg["sl_pips"] * pip_size(instrument)
     units = risk_amount / stop_distance
     return max(1, int(units))
 
 
-def estimate_margin(units, price):
-    return abs(units) * price * ASSUMED_MARGIN_RATE
+def estimate_margin(units, price, instrument):
+    return abs(units) * price * margin_rate(instrument)
 
 
 def sma(values, period):
@@ -212,14 +265,16 @@ def get_signal(closes, fast_period, slow_period):
     return None
 
 
-def place_market_order(cfg, instrument, units, price):
+def place_market_order(cfg, instrument, units, price, instr_cfg):
     pip = pip_size(instrument)
+    sl_pips = instr_cfg["sl_pips"]
+    tp_pips = instr_cfg["tp_pips"]
     if units > 0:
-        sl = round(price - cfg["sl_pips"] * pip, 5)
-        tp = round(price + cfg["tp_pips"] * pip, 5)
+        sl = round(price - sl_pips * pip, 5)
+        tp = round(price + tp_pips * pip, 5)
     else:
-        sl = round(price + cfg["sl_pips"] * pip, 5)
-        tp = round(price - cfg["tp_pips"] * pip, 5)
+        sl = round(price + sl_pips * pip, 5)
+        tp = round(price - tp_pips * pip, 5)
 
     order = {
         "order": {
@@ -241,8 +296,8 @@ def place_market_order(cfg, instrument, units, price):
 def main():
     check_config()
     cfg = PROFILES[RISK_PROFILE]
-    log(f"Profil : {cfg['label']} | Paires : {cfg['instruments']} | "
-        f"Risque/trade : {cfg['risk_per_trade_pct']}% | SL/TP : {cfg['sl_pips']}/{cfg['tp_pips']} pips")
+    log(f"Profil : {cfg['label']} | Instruments : {list(cfg['instruments'])} | "
+        f"Risque/trade : {cfg['risk_per_trade_pct']}% | Granularite : {GRANULARITY}")
 
     state = load_state(cfg)
 
@@ -265,10 +320,10 @@ def main():
 
     margin_budget = (cfg["max_margin_usage_pct"] / 100) * cfg["notional_capital"]
 
-    for instrument in cfg["instruments"]:
+    for instrument, instr_cfg in cfg["instruments"].items():
         try:
-            closes = get_candles(instrument, cfg["slow_sma"] + 5)
-            signal = get_signal(closes, cfg["fast_sma"], cfg["slow_sma"])
+            closes = get_candles(instrument, instr_cfg["slow_sma"] + 5)
+            signal = get_signal(closes, instr_cfg["fast_sma"], instr_cfg["slow_sma"])
             position = get_open_position(instrument)
             price = closes[-1]
             trades_today = state["trades_today"].get(instrument, 0)
@@ -287,16 +342,16 @@ def main():
             if signal == "sell" and position == "short":
                 continue
 
-            units = calculate_units(cfg, instrument)
+            units = calculate_units(cfg, instrument, instr_cfg)
             if signal == "sell":
                 units = -units
 
-            new_trade_margin = estimate_margin(units, price)
+            new_trade_margin = estimate_margin(units, price, instrument)
             if margin_used + new_trade_margin > margin_budget:
                 log(f"{instrument} : trade ignore, depasserait le plafond de marge.")
                 continue
 
-            place_market_order(cfg, instrument, units, price)
+            place_market_order(cfg, instrument, units, price, instr_cfg)
             state["trades_today"][instrument] = trades_today + 1
             margin_used += new_trade_margin
 
