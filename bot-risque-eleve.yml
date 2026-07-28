@@ -1,0 +1,36 @@
+name: Bot Risque Eleve
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recuperer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dependances
+        run: pip install requests
+
+      - name: Executer le bot (risque eleve, compte demo)
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID_HIGH }}
+          RISK_PROFILE: HIGH
+        run: python forex_bot.py
+
+      - name: Sauvegarder l'etat du bot
+        run: |
+          git config user.name "forex-bot-risque-eleve"
+          git config user.email "bot@users.noreply.github.com"
+          git add bot_state_high.json
+          git diff --quiet --cached || git commit -m "Mise a jour etat - risque eleve"
+          git push
