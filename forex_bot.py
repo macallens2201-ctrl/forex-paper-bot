@@ -56,8 +56,8 @@ PROFILES = {
         "notional_capital": 10000.0,
         "risk_per_trade_pct": 2.0,
         "instruments": ["EUR_USD", "GBP_USD", "USD_JPY"],
-        "fast_sma": 20,
-        "slow_sma": 50,
+        "fast_sma": 15,
+        "slow_sma": 20,
         "sl_pips": 25,
         "tp_pips": 50,                # ratio 1:2
         "max_trades_per_day_per_pair": 2,
@@ -70,7 +70,7 @@ PROFILES = {
         "risk_per_trade_pct": 5.0,
         "instruments": ["EUR_USD", "GBP_USD", "USD_JPY", "GBP_JPY", "AUD_USD", "EUR_JPY"],
         "fast_sma": 10,
-        "slow_sma": 30,
+        "slow_sma": 15,
         "sl_pips": 15,
         "tp_pips": 30,                 # ratio 1:2, signaux plus frequents
         "max_trades_per_day_per_pair": 3,
@@ -78,6 +78,20 @@ PROFILES = {
         "daily_loss_circuit_breaker_pct": 8.0,
     },
 }
+# Parametres SMA (fast/slow) recalibres le 2026-07-28 a partir d'un backtest sur
+# ~52 jours de donnees reelles OANDA M15 (66 combinaisons testees par profil,
+# stop/take fixes selon le profil, une seule position a la fois par paire).
+# LOW (EUR/USD) volontairement laisse inchange (50/200) : sur cet echantillon,
+# seules 2/66 combinaisons etaient gagnantes, toutes deux avec ~12-13 trades
+# seulement sur 52 jours - pas assez pour distinguer un vrai signal du bruit,
+# et leurs voisins immediats dans la grille etaient nettement perdants
+# (pas de "plateau" robuste, juste un pic isole = probable overfitting).
+# MODERATE (20/50 -> 15/20) et HIGH (10/30 -> 10/15) ont ete resserres car ces
+# zones formaient un plateau robuste de resultats positifs chez plusieurs
+# combinaisons voisines, avec un nombre de trades bien plus eleve (n=134 et
+# n=693 sur la periode testee) donnant une significativite statistique correcte.
+# A revalider periodiquement (walk-forward) : un backtest sur 52 jours reste
+# un seul regime de marche, pas une garantie de performance future.
 
 GRANULARITY = "M15"
 ASSUMED_MARGIN_RATE = 1 / 30   # levier suppose 30:1 (standard UE sur les majors)
