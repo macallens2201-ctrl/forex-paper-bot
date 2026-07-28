@@ -1,18 +1,25 @@
 """
-Bot de PAPER TRADING Forex - version CLOUD (execution unique, pour GitHub Actions)
+Bot de PAPER TRADING Forex - version CLOUD v2 (profil "risque modere +++")
 ====================================================================================
 
-Version du bot concue pour etre declenchee automatiquement toutes les 15 minutes
-par GitHub Actions, sans rien installer ni faire tourner sur ta machine.
+Concu pour etre declenche automatiquement toutes les 15 minutes par GitHub
+Actions. Utilise UNIQUEMENT l'environnement "practice" (demo) d'OANDA.
 
-Meme securite que la version locale :
-- Utilise UNIQUEMENT l'environnement "practice" (demo) d'OANDA.
-- Ne peut pas passer d'ordre en argent reel.
-- Strategie : croisement de moyennes mobiles (SMA rapide / SMA lente).
+CHANGEMENTS PAR RAPPORT A LA V1 :
+- Capital de reference fixe a 10 000 CHF (au lieu du solde reel du compte
+  demo, qui peut etre bien plus eleve) : tout le calcul de risque se base
+  sur ce capital notionnel, pour simuler un depart realiste.
+- Risque par trade porte a 2% (au lieu de 1%) du capital de reference.
+- Diversification sur 3 paires majeures : EUR_USD, GBP_USD, USD_JPY.
+- Stop loss 25 pips / Take profit 50 pips (ratio 1:2).
+- Garde-fous portefeuille :
+    * plafond d'utilisation de marge cumulee (evite le sur-engagement si
+      plusieurs paires signalent en meme temps)
+    * coupe-circuit de perte journaliere (arrete l'ouverture de nouveaux
+      trades pour le reste de la journee si la perte du jour depasse un
+      seuil defini)
 
-Ce script s'execute une seule fois puis s'arrete (pas de boucle infinie) :
-c'est GitHub Actions (via le fichier .github/workflows/forex-bot.yml) qui le
-relance automatiquement toutes les 15 minutes, gratuitement.
+Ce script reste un outil pedagogique. Aucun gain n'est garanti.
 """
 
 import os
@@ -23,7 +30,7 @@ from datetime import date
 import requests
 
 # ------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION - PROFIL "RISQUE MODERE +++"
 # ------------------------------------------------------------------
 
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
@@ -32,16 +39,25 @@ OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 # URL FIXE sur l'environnement practice (demo). Ne jamais changer.
 OANDA_BASE_URL = "https://api-fxpractice.oanda.com"
 
-INSTRUMENT = "EUR_USD"
+NOTIONAL_CAPITAL_CHF = 10000.0   # capital de reference pour le calcul du risque
+RISK_PER_TRADE_PCT = 2.0         # % du capital notionnel risque par trade
+
+INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY"]
 GRANULARITY = "M15"
 FAST_SMA = 20
 SLOW_SMA = 50
-RISK_PER_TRADE_PCT = 1.0
-STOP_LOSS_PIPS = 20
-TAKE_PROFIT_PIPS = 40
-MAX_TRADES_PER_DAY = 3
 
-STATE_FILE = "bot_state.json"  # garde le compteur de trades du jour entre 2 executions
+STOP_LOSS_PIPS = 25
+TAKE_PROFIT_PIPS = 50            # ratio risque/rendement 1:2
+
+MAX_TRADES_PER_DAY_PER_PAIR = 2
+
+ASSUMED_MARGIN_RATE = 1 / 30     # levier suppose 30:1 (standard UE sur les majors)
+MAX_MARGIN_USAGE_PCT = 50.0      # jamais plus de 50% du capital notionnel en marge cumulee
+
+DAILY_LOSS_CIRCUIT_BREAKER_PCT = 4.0  # stoppe les nouveaux trades si -4% du capital sur la journee
+
+STATE_FILE = "bot_state.json"
 
 
 def log(message):
@@ -67,12 +83,19 @@ def api_headers():
 
 
 def load_state():
+    default_state = {
+        "date": str(date.today()),
+        "start_of_day_nav": None,
+        "trades_today": {instr: 0 for instr in INSTRUMENTS},
+    }
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
         if state.get("date") == str(date.today()):
+            for instr in INSTRUMENTS:
+                state.setdefault("trades_today", {}).setdefault(instr, 0)
             return state
-    return {"date": str(date.today()), "trades_today": 0}
+    return default_state
 
 
 def save_state(state):
@@ -110,11 +133,36 @@ def get_open_position(instrument):
     return None
 
 
-def calculate_units(balance, instrument):
-    risk_amount = balance * (RISK_PER_TRADE_PCT / 100)
+def calculate_units(instrument):
+    """Taille de position basee sur un risque fixe de RISK_PER_TRADE_PCT
+    du capital notionnel, compte tenu de la distance du stop loss."""
+    risk_amount = NOTIONAL_CAPITAL_CHF * (RISK_PER_TRADE_PCT / 100)
     stop_distance = STOP_LOSS_PIPS * pip_size(instrument)
     units = risk_amount / stop_distance
-    return max(1, int(units / 100))
+    return max(1, int(units))
+
+
+def estimate_margin(units, price):
+    notional = abs(units) * price
+    return notional * ASSUMED_MARGIN_RATE
+
+
+def sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def get_signal(closes):
+    fast_now, slow_now = sma(closes, FAST_SMA), sma(closes, SLOW_SMA)
+    fast_prev, slow_prev = sma(closes[:-1], FAST_SMA), sma(closes[:-1], SLOW_SMA)
+    if None in (fast_now, slow_now, fast_prev, slow_prev):
+        return None
+    if fast_prev <= slow_prev and fast_now > slow_now:
+        return "buy"
+    if fast_prev >= slow_prev and fast_now < slow_now:
+        return "sell"
+    return None
 
 
 def place_market_order(instrument, units, price):
@@ -140,51 +188,75 @@ def place_market_order(instrument, units, price):
     url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     resp = requests.post(url, headers=api_headers(), data=json.dumps(order), timeout=15)
     resp.raise_for_status()
-    log(f"Ordre envoye : {units} unites de {instrument} pres de {price}")
-
-
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-
-def get_signal(closes):
-    fast_now, slow_now = sma(closes, FAST_SMA), sma(closes, SLOW_SMA)
-    fast_prev, slow_prev = sma(closes[:-1], FAST_SMA), sma(closes[:-1], SLOW_SMA)
-    if None in (fast_now, slow_now, fast_prev, slow_prev):
-        return None
-    if fast_prev <= slow_prev and fast_now > slow_now:
-        return "buy"
-    if fast_prev >= slow_prev and fast_now < slow_now:
-        return "sell"
-    return None
+    log(f"Ordre envoye : {units} unites de {instrument} pres de {price} "
+        f"(SL {sl} / TP {tp})")
 
 
 def main():
     check_config()
     state = load_state()
 
-    closes = get_candles(INSTRUMENT, GRANULARITY)
-    signal = get_signal(closes)
-    position = get_open_position(INSTRUMENT)
     account = get_account_summary()
-    balance = float(account["balance"])
-    price = closes[-1]
+    nav = float(account["NAV"])
+    margin_used = float(account["marginUsed"])
 
-    log(f"{INSTRUMENT} = {price} | Signal = {signal} | Position = {position} | "
-        f"Solde = {balance:.2f} | Trades aujourd'hui = {state['trades_today']}/{MAX_TRADES_PER_DAY}")
+    if state["start_of_day_nav"] is None:
+        state["start_of_day_nav"] = nav
 
-    if state["trades_today"] >= MAX_TRADES_PER_DAY:
-        log("Limite quotidienne atteinte, aucun ordre.")
-    elif signal == "buy" and position != "long":
-        place_market_order(INSTRUMENT, calculate_units(balance, INSTRUMENT), price)
-        state["trades_today"] += 1
-    elif signal == "sell" and position != "short":
-        place_market_order(INSTRUMENT, -calculate_units(balance, INSTRUMENT), price)
-        state["trades_today"] += 1
-    else:
-        log("Aucun signal exploitable, rien a faire.")
+    daily_pnl = nav - state["start_of_day_nav"]
+    daily_loss_limit = -(DAILY_LOSS_CIRCUIT_BREAKER_PCT / 100) * NOTIONAL_CAPITAL_CHF
+    circuit_breaker_tripped = daily_pnl <= daily_loss_limit
+
+    log(f"NAV = {nav:.2f} | Marge utilisee = {margin_used:.2f} | "
+        f"PnL du jour = {daily_pnl:.2f} (seuil coupe-circuit {daily_loss_limit:.2f})")
+
+    if circuit_breaker_tripped:
+        log("COUPE-CIRCUIT DECLENCHE : perte journaliere >= seuil, "
+            "aucun nouveau trade ne sera ouvert aujourd'hui.")
+
+    margin_budget = (MAX_MARGIN_USAGE_PCT / 100) * NOTIONAL_CAPITAL_CHF
+
+    for instrument in INSTRUMENTS:
+        try:
+            closes = get_candles(instrument, GRANULARITY)
+            signal = get_signal(closes)
+            position = get_open_position(instrument)
+            price = closes[-1]
+            trades_today = state["trades_today"].get(instrument, 0)
+
+            log(f"{instrument} = {price} | Signal = {signal} | Position = {position} | "
+                f"Trades aujourd'hui = {trades_today}/{MAX_TRADES_PER_DAY_PER_PAIR}")
+
+            if circuit_breaker_tripped:
+                continue
+            if trades_today >= MAX_TRADES_PER_DAY_PER_PAIR:
+                log(f"{instrument} : limite quotidienne atteinte, aucun ordre.")
+                continue
+            if signal is None:
+                continue
+            if signal == "buy" and position == "long":
+                continue
+            if signal == "sell" and position == "short":
+                continue
+
+            units = calculate_units(instrument)
+            if signal == "sell":
+                units = -units
+
+            new_trade_margin = estimate_margin(units, price)
+            if margin_used + new_trade_margin > margin_budget:
+                log(f"{instrument} : trade ignore, depasserait le plafond de marge "
+                    f"({margin_used:.2f} + {new_trade_margin:.2f} > {margin_budget:.2f}).")
+                continue
+
+            place_market_order(instrument, units, price)
+            state["trades_today"][instrument] = trades_today + 1
+            margin_used += new_trade_margin  # reserve la marge pour les paires suivantes de ce cycle
+
+        except requests.exceptions.RequestException as e:
+            log(f"{instrument} : erreur reseau/API : {e}")
+        except Exception as e:
+            log(f"{instrument} : erreur inattendue : {e}")
 
     save_state(state)
 
