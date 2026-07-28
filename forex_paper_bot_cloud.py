@@ -91,9 +91,9 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
-        if state.get("date") == str(date.today()):
+        if state.get("date") == str(date.today()) and isinstance(state.get("trades_today"), dict):
             for instr in INSTRUMENTS:
-                state.setdefault("trades_today", {}).setdefault(instr, 0)
+                state["trades_today"].setdefault(instr, 0)
             return state
     return default_state
 
